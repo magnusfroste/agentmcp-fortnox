@@ -1,0 +1,14 @@
+# agentmcp-fortnox with plain Docker: docker compose up -d --build
+# Put your HTTPS proxy in front, on the domain registered in Fortnox, to port 8000.
+services:
+  fortnox:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - fortnox-data:/data
+
+volumes:
+  fortnox-data:
