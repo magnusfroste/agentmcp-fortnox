@@ -1,4 +1,4 @@
-# agentmcp-fortnox: one company's Fortnox over MCP. Data, tokens and the write log live in /data.
+# agentmcp-fortnox: Fortnox over MCP, for one company or several. Data, tokens and the write logs live in /data.
 FROM python:3.13.1-alpine
 RUN apk add --no-cache poppler-utils
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_DIR=/data PORT=8000

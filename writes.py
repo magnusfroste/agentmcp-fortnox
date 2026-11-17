@@ -10,6 +10,9 @@ for what the tool does not name.
 
 Upload store: POST /upload?namn=<file> with the agent key and the file as the body gives an id;
 ladda_upp_fil takes that id, so a file does not have to travel base64 inside a tool call.
+
+Everything here acts on the company bound to the call (fortnox_api.cur()): the tokens it writes
+with, the upload store it reads from and the log it lands in. No tool takes a company argument.
 """
 import base64
 import contextvars
@@ -24,8 +27,6 @@ import urllib.parse
 import fortnox_api
 from fortnox_api import FortnoxError
 
-DATA = os.environ.get("DATA_DIR", "/data")
-UPLOADS = os.path.join(fortnox_api.STATE, "uploads")
 UPLOAD_MAX = 25 * 1024 * 1024
 UPLOAD_HOURS = 24
 
@@ -110,7 +111,7 @@ def t_skapa_verifikation(a):
     out = {"skapad": True, "serie": v.get("VoucherSeries"), "nummer": v.get("VoucherNumber"),
            "rakenskapsar_id": v.get("Year"), "summa": total}
     try:
-        out["verifikation"] = fortnox_api.refresh_voucher(DATA, v.get("VoucherSeries"), v.get("VoucherNumber"), v.get("Year"))
+        out["verifikation"] = fortnox_api.refresh_voucher(v.get("VoucherSeries"), v.get("VoucherNumber"), v.get("Year"))
     except Exception as e:  # written in Fortnox all the same; the next sync picks it up
         out["not"] = f"Skapad i Fortnox, men kunde inte hämtas tillbaka direkt ({e}). Nästa synk tar med den."
     out["rattelse"] = ("En verifikation kan inte tas bort i Fortnox. Fel rättas med en ny verifikation som vänder "
@@ -228,18 +229,19 @@ def t_spara_register(a):
 # --- files ----------------------------------------------------------------------------------
 
 def save_upload(name, data):
-    """Keep an uploaded file for UPLOAD_HOURS; returns its id."""
+    """Keep an uploaded file for UPLOAD_HOURS in the bound company's store; returns its id."""
     if len(data) > UPLOAD_MAX:
         raise ValueError(f"Filen är större än {UPLOAD_MAX // (1024 * 1024)} MB.")
-    os.makedirs(UPLOADS, exist_ok=True)
+    store = fortnox_api.cur().uploads
+    os.makedirs(store, exist_ok=True)
     now = time.time()
     with _upload_lock:
-        for f in os.listdir(UPLOADS):
-            if now - os.path.getmtime(os.path.join(UPLOADS, f)) > UPLOAD_HOURS * 3600:
-                os.remove(os.path.join(UPLOADS, f))
+        for f in os.listdir(store):
+            if now - os.path.getmtime(os.path.join(store, f)) > UPLOAD_HOURS * 3600:
+                os.remove(os.path.join(store, f))
         uid = secrets.token_hex(12)
         safe = re.sub(r"[^\w.\-]+", "_", name or "fil", flags=re.UNICODE)[:80] or "fil"
-        fd = os.open(os.path.join(UPLOADS, f"{uid}__{safe}"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(os.path.join(store, f"{uid}__{safe}"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
     return uid
@@ -248,10 +250,11 @@ def save_upload(name, data):
 def _upload(uid):
     if not re.fullmatch(r"[0-9a-f]{24}", uid or ""):
         raise ValueError("Ogiltigt uppladdnings-id.")
-    found = [f for f in (os.listdir(UPLOADS) if os.path.isdir(UPLOADS) else []) if f.startswith(uid + "__")]
+    store = fortnox_api.cur().uploads  # another company's id is simply not here
+    found = [f for f in (os.listdir(store) if os.path.isdir(store) else []) if f.startswith(uid + "__")]
     if not found:
         raise ValueError(f"Uppladdningen finns inte (den sparas i {UPLOAD_HOURS} h). Ladda upp igen via POST /upload.")
-    with open(os.path.join(UPLOADS, found[0]), "rb") as f:
+    with open(os.path.join(store, found[0]), "rb") as f:
         return found[0].split("__", 1)[1], f.read()
 
 

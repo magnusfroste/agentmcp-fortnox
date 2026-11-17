@@ -1,5 +1,8 @@
 """A small Fortnox for the tests: OAuth with PKCE and rotating refresh tokens, and the parts of
-API v3 the service uses. Every request is recorded in .calls as (method, path, query, body)."""
+API v3 the service uses. Like the real one it is one integration with several companies: a sign-in
+is for one company (issue_code) and the tokens it gives reach that company only. Every request is
+recorded in .calls as (method, path, query, body), and in the company's own .calls once the token
+says which company it is."""
 import base64
 import hashlib
 import json
@@ -12,16 +15,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
-class Fake:
-    def __init__(self):
+class Company:
+    """One company's books in the fake."""
+
+    def __init__(self, name, org, database, vouchers=(), invoices=()):
         self.calls = []
-        self.codes = {}            # code -> PKCE challenge
-        self.access = set()
-        self.refresh = set()
-        self.dead_refresh = set()
-        self.throttle = 0          # answer 429 this many times
         self.locked_until = "2025-12-31"  # vouchers on or before this date are refused
-        self.company = {"CompanyName": "Exempel Bygg AB", "OrganizationNumber": "556677-8899", "DatabaseNumber": 4711}
+        self.company = {"CompanyName": name, "OrganizationNumber": org, "DatabaseNumber": database}
+        self.pdf = PDF + f"% {name}\n".encode()  # every company's documents are its own bytes
         self.years = [{"Id": 1, "FromDate": "2025-01-01", "ToDate": "2025-12-31"},
                       {"Id": 2, "FromDate": "2026-01-01", "ToDate": "2026-12-31"}]
         self.accounts = {1930: "Företagskonto", 2440: "Leverantörsskulder", 2640: "Ingående moms",
@@ -35,8 +36,12 @@ class Fake:
         self.file_connections = []
         self.customers = {}
         self._n = 100
-        self._add_voucher(2, "A", "2026-02-01", "Hyra februari", [(5010, 10000, 0), (1930, 0, 10000)])
-        self._add_voucher(2, "A", "2026-02-15", "Försäljning", [(1930, 25000, 0), (3001, 0, 20000), (2611, 0, 5000)])
+        for day, text, rows in vouchers:
+            self._add_voucher(2, "A", day, text, rows)
+        for day, customer, total in invoices:
+            n = self.next()
+            self.invoices[n] = {"DocumentNumber": n, "InvoiceDate": day, "CustomerName": customer, "Total": total,
+                                "Currency": "SEK", "Booked": True, "Sent": True, "Cancelled": False}
 
     def next(self):
         self._n += 1
@@ -49,19 +54,48 @@ class Fake:
         self.vouchers[(year, series, n)] = v
         return v
 
-    def issue_code(self, challenge):
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+    def year_of(self, day):
+        return next(y["Id"] for y in self.years if y["FromDate"] <= day <= y["ToDate"])
+
+
+class Fake:
+    """The fake Fortnox. .main is the company the single-company tests use; what they read off the
+    fake itself (.files, .invoices ...) is that company's."""
+
+    def __init__(self):
+        self.calls = []
+        self.codes = {}            # code -> (PKCE challenge, company)
+        self.access = {}           # access token -> company
+        self.refresh = {}          # refresh token -> company
+        self.dead_refresh = set()
+        self.throttle = 0          # answer 429 this many times
+        self.main = Company("Exempel Bygg AB", "556677-8899", 4711, vouchers=[
+            ("2026-02-01", "Hyra februari", [(5010, 10000, 0), (1930, 0, 10000)]),
+            ("2026-02-15", "Försäljning", [(1930, 25000, 0), (3001, 0, 20000), (2611, 0, 5000)])])
+
+    def __getattr__(self, name):   # only reached for what Fake itself does not have
+        return getattr(self.main, name)
+
+    def issue_code(self, challenge, company=None):
+        """What Fortnox sends back after a system administrator of that company has approved."""
         code = secrets.token_hex(8)
-        self.codes[code] = challenge
+        self.codes[code] = (challenge, company or self.main)
         return code
 
     def expire_access(self):
         self.access.clear()
 
+    def revoke(self, company):
+        """The company withdrew the integration: none of its tokens work any more."""
+        for tokens in (self.access, self.refresh):
+            for k in [k for k, c in tokens.items() if c is company]:
+                tokens.pop(k)
+
     def writes(self):
         return [c for c in self.calls if c[0] != "GET" and not c[1].startswith("/oauth")]
-
-    def year_of(self, day):
-        return next(y["Id"] for y in self.years if y["FromDate"] <= day <= y["ToDate"])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -95,15 +129,17 @@ class Handler(BaseHTTPRequestHandler):
             f.throttle -= 1
             return self.error(429, "Too many requests")
         auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] not in f.access:
+        company = f.access.get(auth[7:]) if auth.startswith("Bearer ") else None
+        if not company:
             return self.error(401, "Unauthorized", 2000311)
-        return self.api(method, path, q, body, raw, ctype)
+        company.calls.append(f.calls[-1])
+        return self.api(company, method, path, q, body, raw, ctype)
 
     def token(self, form):
         f = self.fake
         form = {k: v[0] for k, v in form.items()}
         if form.get("grant_type") == "authorization_code":
-            challenge = f.codes.pop(form.get("code"), None)
+            challenge, company = f.codes.pop(form.get("code"), (None, None))
             verifier = form.get("code_verifier", "")
             calc = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
             if not challenge or calc != challenge:
@@ -112,13 +148,13 @@ class Handler(BaseHTTPRequestHandler):
             old = form.get("refresh_token")
             if old not in f.refresh:
                 return self.answer(400, {"error": "invalid_grant"})
-            f.refresh.discard(old)
+            company = f.refresh.pop(old)
             f.dead_refresh.add(old)
         else:
             return self.answer(400, {"error": "unsupported_grant_type"})
         access, refresh = secrets.token_hex(16), secrets.token_hex(16)
-        f.access.add(access)
-        f.refresh.add(refresh)
+        f.access[access] = company
+        f.refresh[refresh] = company
         return self.answer(200, {"access_token": access, "refresh_token": refresh, "expires_in": 3600,
                                  "token_type": "bearer", "scope": "x"})
 
@@ -129,8 +165,8 @@ class Handler(BaseHTTPRequestHandler):
                                                      "@CurrentPage": page},
                                  key: items[(page - 1) * limit:page * limit]})
 
-    def api(self, method, path, q, body, raw, ctype):
-        f = self.fake
+    def api(self, f, method, path, q, body, raw, ctype):
+        """f: the company the access token belongs to. Nothing here can reach another one."""
         if method == "GET" and path == "/3/companyinformation":
             return self.answer(200, {"CompanyInformation": f.company})
         if method == "GET" and path == "/3/financialyears":
@@ -195,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
         if m and int(m.group(1)) in f.invoices:
             inv = f.invoices[int(m.group(1))]
             if method == "GET" and m.group(2) == "preview":
-                return self.answer(200, raw=PDF, ctype="application/pdf")
+                return self.answer(200, raw=f.pdf, ctype="application/pdf")
             if method == "PUT" and m.group(2) == "bookkeep":
                 inv["Booked"] = True
             elif method == "GET" and m.group(2) == "email":
@@ -222,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(201, {"File": {"Id": fid, "Name": f.files[fid]["name"]}})
         m = re.fullmatch(r"/3/archive/(\w+)", path)
         if method == "GET" and m:
-            return self.answer(200, raw=PDF, ctype="application/pdf")
+            return self.answer(200, raw=f.pdf, ctype="application/pdf")
         if method == "POST" and path == "/3/customers":
             n = str(f.next())
             f.customers[n] = {**body["Customer"], "CustomerNumber": n}

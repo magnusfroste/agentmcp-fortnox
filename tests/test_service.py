@@ -4,7 +4,7 @@ import os
 
 import fortnox_api
 import mcp_server
-from conftest import FAKE, KEY, OTHER_KEY, http, ok, sign_in, tool
+from conftest import ALFA_AB, DATA, FAKE, KEY, MAIN, OTHER_KEY, http, ok, sign_in, tool
 
 
 def test_without_a_key_nothing_answers():
@@ -18,7 +18,8 @@ def test_sign_in_names_the_company_and_the_first_sync_only_reads(signed_in):
     st = ok("kalla_status")
     assert st["bolag"] == "Exempel Bygg AB" and st["organisationsnummer"] == "556677-8899"
     assert st["verifikationer_med_rader"] == 2
-    assert fortnox_api.company()["own_vat"] == "SE556677889901"
+    with fortnox_api.use(MAIN):
+        assert fortnox_api.company()["own_vat"] == "SE556677889901"
     sync_calls = [c for c in FAKE.calls if not c[1].startswith("/oauth")]
     assert sync_calls and all(c[0] == "GET" for c in sync_calls)
 
@@ -38,13 +39,18 @@ def test_instructions_and_tools_name_no_other_company(signed_in):
 
 
 def test_a_second_company_cannot_take_over(signed_in):
-    FAKE.company = {**FAKE.company, "CompanyName": "Annat AB", "DatabaseNumber": 9999}
-    try:
-        status, body = sign_in()
-        assert status == 400 and "redan kopplad" in body.decode()
+    status, body = sign_in(approved_by=ALFA_AB)  # the same start link, approved by another company's administrator
+    assert status == 400 and "redan kopplad" in body.decode()
+    with fortnox_api.use(MAIN):
         assert fortnox_api.company()["company"] == "Exempel Bygg AB"
-    finally:
-        FAKE.company = {**FAKE.company, "CompanyName": "Exempel Bygg AB", "DatabaseNumber": 4711}
+
+
+def test_keys_without_a_company_keep_the_single_company_layout(signed_in):
+    """What a deployment from before companies has on disk, and still has: nothing moved."""
+    assert MAIN.token == os.path.join(DATA, ".state", "token.json") and os.path.exists(MAIN.token)
+    assert MAIN.manifest == os.path.join(DATA, "manifest.jsonl")
+    assert os.path.exists(os.path.join(DATA, ".state", "sync.json"))
+    assert os.path.exists(os.path.join(DATA, "fortnox-api", "bokforing", "verifikationer.json"))
 
 
 def test_the_books_add_up(signed_in):
@@ -66,7 +72,8 @@ def test_a_voucher_shows_at_once_and_is_logged_with_the_key(signed_in):
     log = ok("skrivlogg")["skrivningar"][0]
     assert log["nyckel"] == "hermes" and log["metod"] == "POST" and log["sokvag"] == "/3/vouchers"
     assert log["skapat"]["Voucher"]["VoucherNumber"] == out["nummer"] and log["fel"] is None
-    st = os.stat(fortnox_api.WRITES)
+    assert MAIN.writes == os.path.join(DATA, ".state", "writes.jsonl")
+    st = os.stat(MAIN.writes)
     assert st.st_mode & 0o077 == 0
 
 
@@ -144,14 +151,14 @@ def test_the_general_tool_reads_without_logging_and_refuses_odd_paths(signed_in)
 
 
 def test_an_expired_token_is_refreshed_and_the_old_refresh_token_is_dead(signed_in):
-    old = fortnox_api._load(fortnox_api.TOKEN, {})
-    fortnox_api._save(fortnox_api.TOKEN, {**old, "expires_at": 0})
+    old = fortnox_api._load(MAIN.token, {})
+    fortnox_api._save(MAIN.token, {**old, "expires_at": 0})
     FAKE.expire_access()
     ok("fortnox_api", sokvag="/3/companyinformation")
-    new = fortnox_api._load(fortnox_api.TOKEN, {})
+    new = fortnox_api._load(MAIN.token, {})
     assert new["refresh_token"] != old["refresh_token"] and old["refresh_token"] in FAKE.dead_refresh
     assert new["company"] == "Exempel Bygg AB" and new["own_vat"] == "SE556677889901"
-    assert os.stat(fortnox_api.TOKEN).st_mode & 0o077 == 0
+    assert os.stat(MAIN.token).st_mode & 0o077 == 0
 
 
 def test_rate_limit_answers_are_waited_out(signed_in, monkeypatch):
@@ -175,7 +182,7 @@ def test_read_only_refuses_every_write_before_fortnox(signed_in, monkeypatch):
 
 def test_a_later_sync_keeps_what_was_written_and_still_only_reads(signed_in):
     n = len(FAKE.calls)
-    mcp_server.sync_once()
+    mcp_server.sync_once(MAIN)
     assert all(c[0] == "GET" for c in FAKE.calls[n:] if not c[1].startswith("/oauth"))
     assert ok("verifikationer", text="Hyra mars")["antal"] == 1
     assert ok("kalla_status")["senaste_synk_resultat"]["bokforing"]["totalt"] >= 4

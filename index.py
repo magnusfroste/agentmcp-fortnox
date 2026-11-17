@@ -6,6 +6,9 @@ Two sources share the folder layout <source>/<year>/<month>/<category>/<file>:
   fortnox-api/      written by fortnox_api.py, each PDF with a <file>.json of Fortnox's own fields
   fortnox-export/   optional: an export from Fortnox put there by hand (empty or absent is fine)
 
+ROOT is one company's folder: DATA_DIR for the default company, DATA_DIR/companies/<name> for a
+named one (ROOT/companies itself is never walked).
+
 Re-runnable: a file already indexed with the same sha256 is skipped. --refresh rebuilds every
 line (to pick up new fields) without extracting text again. Text goes to .text/<sha256>.txt.
 
@@ -26,6 +29,7 @@ import sys
 import unicodedata
 
 VERSION = 2  # bump when describe() gains fields, and the index is rebuilt on start
+COMPANIES = "companies"  # ROOT/companies/<name>: other companies' folders, each indexed on its own, never as ROOT's
 CATEGORIES = {"leverantörsfakturor": "leverantorsfaktura", "kundfakturor": "kundfaktura",
               "verifikationer": "verifikation"}
 WORDS = [w.strip().lower() for w in os.environ.get("INDEX_WORDS", "").split(",") if w.strip()]
@@ -153,9 +157,11 @@ def describe(root, path, data, digest, own=None):
     return entry
 
 
-def build(root="/data", refresh=False, changed=(), own=None):
+def build(root="/data", refresh=False, changed=(), own=None, skip=(COMPANIES,)):
     """Index what is new. changed: files (relative to root) whose PDF or .json was rewritten in
-    place -- their old entries go and they are described again. own: see describe()."""
+    place -- their old entries go and they are described again. own: see describe(). skip: folders
+    directly under root that are not this company's. By default the folder the named companies are
+    in, so that no caller, nor this file run by hand on DATA_DIR, puts their documents in root's index."""
     manifest = os.path.join(root, "manifest.jsonl")
     done, kept = set(), []
     changed = {nfc(c) for c in changed}
@@ -168,7 +174,7 @@ def build(root="/data", refresh=False, changed=(), own=None):
     rewrite = refresh or bool(changed)
     lines, added = [], 0
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not (dirpath == root and d in skip))
         for name in sorted(files):
             if name.startswith(("manifest.", ".")) or name.endswith((".json", ".part")):
                 continue

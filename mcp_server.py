@@ -1,23 +1,31 @@
-"""MCP server for one company's Fortnox: agents read the books and documents, and write.
+"""MCP server for Fortnox: agents read a company's books and documents, and write.
 
-One company, one integration in its own Fortnox, one service. The store:
+One integration in Fortnox and one service serve one company or several. Every agent key is bound
+to exactly one company (the third part of its MCP_KEYS entry; without one, the default company),
+and the key is the only thing that decides whose books a call reaches: no tool takes a company.
+Each company has its own folder (see fortnox_api.py), with the store:
   fortnox-api/      synced from the Fortnox API once a system administrator has signed in (fortnox_api.py)
   fortnox-export/   optional: an export from Fortnox put there by hand
-Both are indexed by index.py into DATA_DIR/manifest.jsonl; agents see the same tools either way.
+Both are indexed by index.py into the company's manifest.jsonl; agents see the same tools either way.
 The bookkeeping (vouchers with rows, accounts) comes from the API. The write tools are in writes.py;
-every write is logged with the agent key's name (tool skrivlogg).
+every write is logged with the agent key's name (tool skrivlogg), in the company's own log.
 
 Environment (besides fortnox_api.py's FORTNOX_* and index.py's INDEX_*):
-  MCP_KEYS            name:key pairs, comma separated; keys 32+ characters
+  MCP_KEYS            name:key or name:key:company, comma separated; keys 32+ characters; a company
+                      is a-z, 0-9 and -. Without a company the key reaches the default company
   LINK_SECRET         signs PDF links (random per start if unset)
-  OAUTH_START_TOKEN   secret path part of /oauth/start/<token>; sign-in is off without it
+  OAUTH_START_TOKEN   the operator's secret: /oauth/start/<token>[/<company>] starts a sign-in and
+                      /health/<token> shows every company. Each company also has an address of its
+                      own, made from this token and its name (start_code), to hand to its
+                      administrator. Sign-in is off without it
   PUBLIC_URL          e.g. https://fortnox.example.se
   REPORT_LINK_BASE    optional: where a report site serves DATA_DIR, for links in published reports
+                      (a named company's files are under companies/<company>/ there)
   SYNC_HOURS          hours between API syncs, default 6
   DATA_DIR / PORT     default /data, 8000
 
-Routes: POST /mcp  |  POST /upload  |  GET /pdf/<token>  |  GET /health  |  GET /oauth/start/<token>
-        |  GET /oauth/callback
+Routes: POST /mcp  |  POST /upload  |  GET /pdf/<token>  |  GET /health  |  GET /health/<token>
+        |  GET /oauth/start/<token>[/<company>]  |  GET /oauth/callback
 """
 import base64
 import collections
@@ -40,8 +48,7 @@ import fortnox_api
 import index
 import writes
 
-DATA = os.environ.get("DATA_DIR", "/data")
-MANIFEST = os.path.join(DATA, "manifest.jsonl")
+DATA = fortnox_api.DATA
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 SECRET = (os.environ.get("LINK_SECRET") or secrets.token_hex(32)).encode()
 OAUTH_START = os.environ.get("OAUTH_START_TOKEN", "")
@@ -50,7 +57,7 @@ SYNC_HOURS = float(os.environ.get("SYNC_HOURS", "6"))
 LINK_SECONDS = 600
 TEXT_LIMIT = 20000
 MCP_BODY_MAX = 40 * 1024 * 1024  # a file sent base64 in a tool call
-SERVER_NAME, SERVER_VERSION = "fortnox", "2.0.0"
+SERVER_NAME, SERVER_VERSION = "fortnox", "2.1.0"
 CATEGORIES = ("leverantorsfaktura", "kundfaktura", "verifikation")
 
 
@@ -59,40 +66,79 @@ def log(msg):
 
 
 def load_keys():
-    keys = {}
+    """MCP_KEYS as {key: (name, company)}. An entry that cannot be read as written is left out and
+    said so in the log: it is never bound to some other company than the one it names."""
+    keys, twice = {}, set()
     for pair in os.environ.get("MCP_KEYS", "").split(","):
-        name, _, key = pair.strip().partition(":")
-        if name and len(key) >= 32:
-            keys[key] = name
-        elif name:
+        parts = pair.strip().split(":")
+        name, key = parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
+        company = parts[2].strip().lower() if len(parts) > 2 else fortnox_api.DEFAULT
+        if not name:
+            continue
+        if len(parts) > 3 or not fortnox_api.SLUG.fullmatch(company):  # the text is not logged: it may be key
+            log(f"key for {name!r} ignored: what follows the key is not a company name "
+                "(name:key:company, company a-z, 0-9 and -, at most 32 characters)")
+        elif len(key) < 32:
             log(f"key for {name!r} ignored: shorter than 32 characters")
+        elif key in twice or keys.get(key, (name, company))[1] != company:
+            log(f"key for {name!r} ignored: the same key is bound to two companies; a key reaches exactly one")
+            keys.pop(key, None)
+            twice.add(key)
+        else:
+            keys[key] = (name, company)
     return keys
 
 
 KEYS = load_keys()
+for _name, _company in KEYS.values():
+    fortnox_api.slot(_company)
 
 
 def who(header):
-    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    """The agent a request's key belongs to and the one company it reaches: (name, slot), or None."""
+    token = header[7:].strip().encode() if header.lower().startswith("bearer ") else b""
     found = None
-    for key, name in KEYS.items():
-        if token and hmac.compare_digest(token, key):
-            found = name
+    for key, (name, company) in KEYS.items():
+        if token and hmac.compare_digest(token, key.encode()):
+            found = (name, fortnox_api.SLOTS[company])
     return found
+
+
+def start_code(slug):
+    """The secret in a company's own sign-in address. The administrator who approves in Fortnox has
+    to be sent an address, and with several organisations in one service that must not be the
+    operator's token: it would open the overview and the sign-in of every other company."""
+    return hmac.new(OAUTH_START.encode(), f"start:{slug}".encode(), hashlib.sha256).hexdigest()[:40]
+
+
+def may_start(token, slug):
+    """Whether a start address is good: 'operator' (OAUTH_START_TOKEN), 'company' (its own code), or None."""
+    if not OAUTH_START:
+        return None
+    if hmac.compare_digest(token.encode(), OAUTH_START.encode()):
+        return "operator"
+    return "company" if hmac.compare_digest(token.encode(), start_code(slug).encode()) else None
+
+
+def tag(name):
+    """An agent in the service's log: its key name, and its company when there are several."""
+    slug = fortnox_api.cur().slug
+    return name if slug == fortnox_api.DEFAULT else f"{name}@{slug}"
 
 
 # --- the store ------------------------------------------------------------------------------
 
-_store = {"mtime": None, "docs": {}, "names": {}}
-_lock = threading.Lock()
-
+# Everything below reads the company bound to the call (fortnox_api.cur()): its folder, its index and
+# its books, each parsed once per change and kept on the company itself.
 
 def store():
-    mtime = os.path.getmtime(MANIFEST)
-    with _lock:
+    company = fortnox_api.cur()
+    mtime = os.path.getmtime(company.manifest)
+    with company.cache_lock:
+        _store = company.cache.setdefault("store", {"mtime": None, "docs": {}, "names": {}})
         if _store["mtime"] != mtime:
             docs = {}
-            with open(MANIFEST) as f:
+            with open(company.manifest) as f:
                 for line in f:
                     try:
                         e = json.loads(line)
@@ -110,14 +156,15 @@ def store():
         return _store["docs"]
 
 
-_books = {"mtime": None, "vouchers": [], "by_ref": {}, "accounts": {}, "years": [], "opening": {}}
-
-
 def books():
     """The bookkeeping synced from the API: vouchers with rows, account names, financial years."""
-    path = fortnox_api.books_path(DATA, "verifikationer.json")
+    company = fortnox_api.cur()
+    root = company.root
+    path = fortnox_api.books_path(root, "verifikationer.json")
     mtime = os.path.getmtime(path) if os.path.exists(path) else None
-    with _lock:
+    with company.cache_lock:
+        _books = company.cache.setdefault("books", {"mtime": None, "vouchers": [], "by_ref": {}, "accounts": {},
+                                              "years": [], "opening": {}})
         if _books["mtime"] != mtime:
             vouchers = sorted(fortnox_api._load(path, {}).values(), key=lambda v: (v.get("datum") or "", v["id"]))
             by_ref = collections.defaultdict(list)
@@ -125,9 +172,9 @@ def books():
                 if v.get("referenstyp") and v.get("referensnummer"):
                     by_ref[(v["referenstyp"], v["referensnummer"])].append(v)
             _books.update(mtime=mtime, vouchers=vouchers, by_ref=by_ref,
-                          accounts=fortnox_api._load(fortnox_api.books_path(DATA, "konton.json"), {}),
-                          years=fortnox_api._load(fortnox_api.books_path(DATA, "rakenskapsar.json"), []),
-                          opening=fortnox_api._load(fortnox_api.books_path(DATA, "ingaende.json"), {}))
+                          accounts=fortnox_api._load(fortnox_api.books_path(root, "konton.json"), {}),
+                          years=fortnox_api._load(fortnox_api.books_path(root, "rakenskapsar.json"), []),
+                          opening=fortnox_api._load(fortnox_api.books_path(root, "ingaende.json"), {}))
         return _books
 
 
@@ -166,13 +213,14 @@ def with_names(v, rows=None):
 def name_of(e):
     if e.get("source") == "fortnox-api" and e.get("counterpart_name"):
         return e["counterpart_name"]  # Fortnox' own field, not read out of the PDF
-    return _store["names"].get(e.get("counterpart_vat")) or e.get("counterpart_name")
+    names = fortnox_api.cur().cache.get("store", {}).get("names", {})
+    return names.get(e.get("counterpart_vat")) or e.get("counterpart_name")
 
 
 def text_of(e):
     if not e.get("text"):
         return ""
-    with open(os.path.join(DATA, e["text"]), errors="replace") as f:
+    with open(os.path.join(fortnox_api.cur().root, e["text"]), errors="replace") as f:
         return f.read()
 
 
@@ -206,20 +254,25 @@ def matches(e, a):
 # --- signed PDF links (same scheme as transportfakturor) ------------------------------------
 
 def sign(sha, seconds=LINK_SECONDS):
+    """A link to one document of the bound company. The company is inside the signature: the link
+    is opened without a key, so it has to say whose document it is."""
     exp = int(time.time()) + seconds
-    body = base64.urlsafe_b64encode(f"{sha}|{exp}".encode()).decode().rstrip("=")
+    body = base64.urlsafe_b64encode(f"{fortnox_api.cur().slug}|{sha}|{exp}".encode()).decode().rstrip("=")
     return f"{body}.{hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]}", exp
 
 
 def verify(token):
+    """(company, sha256) of a link we signed that has not run out, else None."""
     body, _, mac = token.partition(".")
-    if not mac or not hmac.compare_digest(mac, hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]):
+    good = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]
+    if not mac or not hmac.compare_digest(mac.encode(), good.encode()):
         return None
     try:
-        sha, exp = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode().split("|")
+        slug, sha, exp = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode().split("|")
+        company = fortnox_api.SLOTS.get(slug)
+        return (company, sha) if company and int(exp) >= time.time() else None
     except (ValueError, UnicodeDecodeError):
         return None
-    return sha if int(exp) >= time.time() else None
 
 
 # --- tools ----------------------------------------------------------------------------------
@@ -272,8 +325,9 @@ def t_las(a):
     token, exp = sign(e["sha256"])
     out = {**card(e), "pdf_lank": f"{PUBLIC_URL}/pdf/{token}" if PUBLIC_URL else f"/pdf/{token}",
            "pdf_lank_giltig_till": datetime.fromtimestamp(exp, timezone.utc).isoformat(timespec="seconds")}
-    if REPORT_LINK_BASE:
-        out["rapportlank"] = f"{REPORT_LINK_BASE}/{urllib.parse.quote(e['file'])}"
+    if REPORT_LINK_BASE:  # the report site serves DATA_DIR: a named company's files are one level down
+        folder = os.path.relpath(fortnox_api.cur().root, DATA)
+        out["rapportlank"] = f"{REPORT_LINK_BASE}/{urllib.parse.quote(os.path.normpath(os.path.join(folder, e['file'])))}"
     if e.get("fortnox"):
         out["fortnox_falt"] = e["fortnox"]
     if books()["vouchers"]:
@@ -521,7 +575,7 @@ def t_balansrakning(a):
 
 def t_exportera_index(a):
     """The manifest as it is on disk (every file, not only PDFs), a page at a time, for scripts."""
-    with open(MANIFEST) as f:
+    with open(fortnox_api.cur().manifest) as f:
         rows = [json.loads(l) for l in f if l.strip()]
     if a.get("kategori"):
         rows = [r for r in rows if r.get("category") == a["kategori"]]
@@ -647,7 +701,7 @@ def handle(msg, caller):
         fn = BY_NAME.get(name)
         if not fn:
             return err(mid, -32602, f"Okänt verktyg: {name}")
-        log(f"{caller}: {name} {json.dumps({k: v for k, v in args.items() if k != 'innehall_base64'}, ensure_ascii=False)[:200]}")
+        log(f"{tag(caller)}: {name} {json.dumps({k: v for k, v in args.items() if k != 'innehall_base64'}, ensure_ascii=False)[:200]}")
         writes.CALLER.set(caller)
         try:
             result = fn(args)
@@ -656,7 +710,7 @@ def handle(msg, caller):
         except (ValueError, KeyError, TypeError, PermissionError) as e:  # FortnoxError is a ValueError
             return ok(mid, {"content": [{"type": "text", "text": str(e)}], "isError": True})
         except Exception as e:  # a bug must still answer, so the agent says so instead of hanging
-            log(f"{caller}: {name} failed: {type(e).__name__}: {e}")
+            log(f"{tag(caller)}: {name} failed: {type(e).__name__}: {e}")
             return ok(mid, {"content": [{"type": "text", "text": f"Internt fel i {name} ({type(e).__name__}). "
                                                                   "Säg till användaren; gissa inte svaret."}], "isError": True})
     return err(mid, -32601, f"Okänd metod: {method}")
@@ -695,36 +749,54 @@ class Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         if path == "/health":
             return self.send(200, b'{"ok":true}')
+        if path.startswith("/health/"):  # the operator's view: every company, no secrets
+            if not (OAUTH_START and hmac.compare_digest(path[len("/health/"):].encode(), OAUTH_START.encode())):
+                return self.send(404, b'{"error":"not found"}')
+            return self.send(200, json.dumps({"ok": True, "version": SERVER_VERSION, **overview(links=True)},
+                                             ensure_ascii=False).encode())
         if path.startswith("/pdf/"):
-            sha = verify(path[5:])
-            e = next((x for x in store().values() if x["sha256"] == sha), None) if sha else None
+            company, sha = verify(path[5:]) or (None, None)
+            e = data = None
+            if company:
+                with fortnox_api.use(company):
+                    e = next((x for x in store().values() if x["sha256"] == sha), None)
+                    if e:
+                        with open(os.path.join(company.root, e["file"]), "rb") as f:
+                            data = f.read()
             if not e:
                 return self.send(403, b'{"error":"Lanken ar ogiltig eller har gatt ut. Hamta en ny med las_dokument."}')
-            with open(os.path.join(DATA, e["file"]), "rb") as f:
-                data = f.read()
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", e.get("filename") or "dokument.pdf")
             return self.send(200, data, "application/pdf", {"Content-Disposition": f'inline; filename="{safe}"',
                                                             "Cache-Control": "private, no-store"})
-        if path.startswith("/oauth/start/"):
-            if not (OAUTH_START and hmac.compare_digest(path[len("/oauth/start/"):], OAUTH_START)):
+        if path.startswith("/oauth/start/"):  # /oauth/start/<token> or /oauth/start/<token>/<company>
+            token, _, slug = path[len("/oauth/start/"):].partition("/")
+            allowed = may_start(token, slug or fortnox_api.DEFAULT)
+            company = fortnox_api.SLOTS.get(slug or fortnox_api.DEFAULT)
+            if not allowed or (not company and allowed != "operator"):
                 return self.page(404, "Hittades inte", "Adressen finns inte.")
+            if not company:  # only a company some key reaches can be signed in: a typo makes no new one
+                served = ", ".join(sorted(fortnox_api.SLOTS))
+                return self.page(404, "Företaget finns inte här",
+                                 f"Ingen agentnyckel i MCP_KEYS är bunden till {slug or 'standardföretaget'!r}. "
+                                 f"Inloggning finns för: {served}. Adressen är /oauth/start/<nyckel>/<företag>.")
             if not fortnox_api.configured():
                 return self.page(503, "Fortnox är inte konfigurerat",
                                  "FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET och FORTNOX_REDIRECT_URI saknas.")
-            return self.send(302, b"", "text/plain", {"Location": fortnox_api.authorize_url()})
-        if path == "/oauth/callback":
+            return self.send(302, b"", "text/plain", {"Location": fortnox_api.authorize_url(company)})
+        if path == "/oauth/callback":  # the one redirect URI in Fortnox; the signed state says which company
             q = urllib.parse.parse_qs(query)
             if "error" in q:
                 return self.page(400, "Inloggningen avbröts", q.get("error_description", q["error"])[0])
             try:
-                company = fortnox_api.finish(q.get("code", [""])[0], q.get("state", [""])[0])
+                company, name = fortnox_api.finish(q.get("code", [""])[0], q.get("state", [""])[0])
             except Exception as e:
                 log(f"oauth callback failed: {e}")
                 return self.page(400, "Inloggningen misslyckades", str(e)[:300])
-            log(f"fortnox signed in: {company}")
-            threading.Thread(target=sync_once, daemon=True).start()
-            return self.page(200, "Fortnox är kopplat", f"Inloggad mot {company or 'Fortnox'}. Första synken startar nu; "
-                                                        "du kan stänga fönstret.")
+            log(f"fortnox signed in: {company.slug}: {name}")
+            threading.Thread(target=sync_once, args=(company,), daemon=True).start()
+            where = "" if company.slug == fortnox_api.DEFAULT else f" (företagsplats {company.slug})"
+            return self.page(200, "Fortnox är kopplat", f"Inloggad mot {name or 'Fortnox'}{where}. Första synken "
+                                                        "startar nu; du kan stänga fönstret.")
         if path.startswith("/mcp"):
             return self.send(405, b"", extra={"Allow": "POST"})
         return self.send(404, b'{"error":"not found"}')
@@ -736,10 +808,14 @@ class Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         if not (path.startswith("/mcp") or path == "/upload"):
             return self.send(404, b'{"error":"not found"}')
-        caller = who(self.headers.get("Authorization", ""))
+        caller, company = who(self.headers.get("Authorization", "")) or (None, None)
         if not caller:
             return self.send(401, b'{"error":"Saknar eller fel nyckel. Skicka Authorization: Bearer <nyckel>."}',
                              extra={"WWW-Authenticate": "Bearer"})
+        with fortnox_api.use(company):  # the key's company, for everything this request does
+            return self.answer(path, query, caller)
+
+    def answer(self, path, query, caller):
         size = int(self.headers.get("Content-Length") or 0)
         if path == "/upload":
             return self.upload(caller, query, size)
@@ -764,67 +840,104 @@ class Handler(BaseHTTPRequestHandler):
                                                        f"{writes.UPLOAD_MAX // (1024 * 1024)} MB."}).encode())
         name = (urllib.parse.parse_qs(query).get("namn") or ["fil"])[0]
         uid = writes.save_upload(name, self.rfile.read(size))
-        log(f"{caller}: upload {name!r}, {size} bytes")
+        log(f"{tag(caller)}: upload {name!r}, {size} bytes")
         return self.send(200, json.dumps({"uppladdning": uid, "bytes": size, "giltig_timmar": writes.UPLOAD_HOURS,
                                           "nasta_steg": "ladda_upp_fil med uppladdning=" + uid}).encode())
 
 
 # --- background -----------------------------------------------------------------------------
 
-_sync_lock = threading.Lock()
-
-
 def reindex(changed=()):
+    """Bring the bound company's index up to date with its folder."""
+    c = fortnox_api.cur()
     needs_refresh = False
-    if os.path.exists(MANIFEST):
-        with open(MANIFEST) as f:
+    if os.path.exists(c.manifest):
+        with open(c.manifest) as f:
             first = f.readline()
         try:  # an index written by an older describe() is rebuilt, its text is kept
             needs_refresh = bool(first) and json.loads(first).get("v") != index.VERSION
         except ValueError:
             needs_refresh = True
-    added, total = index.build(DATA, refresh=needs_refresh, changed=changed, own=fortnox_api.company())
-    log(f"index: {added} {'re-indexed' if needs_refresh else 'new'}, {total} in total")
+    # The default company's folder is DATA_DIR itself, with the named companies inside it: index.build
+    # leaves that folder (DATA_DIR/companies) out, so their documents never land in this index.
+    added, total = index.build(c.root, refresh=needs_refresh, changed=changed, own=fortnox_api.company())
+    log(f"index {c.slug}: {added} {'re-indexed' if needs_refresh else 'new'}, {total} in total")
 
 
-def sync_once():
-    if not _sync_lock.acquire(blocking=False):
+def sync_once(company):
+    if not company.sync_lock.acquire(blocking=False):
         return
     try:
-        result, changed = fortnox_api.sync(DATA)
-        log(f"fortnox sync: {result}")
-        reindex(changed)
+        with fortnox_api.use(company):
+            result, changed = fortnox_api.sync()
+            log(f"fortnox sync {company.slug}: {result}")
+            reindex(changed)
     except PermissionError as e:
-        log(f"fortnox sync skipped: {e}")
+        log(f"fortnox sync {company.slug} skipped: {e}")
     except Exception as e:
-        log(f"fortnox sync failed: {type(e).__name__}: {e}")
+        log(f"fortnox sync {company.slug} failed: {type(e).__name__}: {e}")
     finally:
-        _sync_lock.release()
+        company.sync_lock.release()
 
 
-_wake = threading.Event()
 WRITE_SETTLE = float(os.environ.get("WRITE_SYNC_SECONDS", "20"))
 
 
 def request_sync():
-    """After a write: sync soon, once, even when an agent writes ten things in a row."""
-    _wake.set()
+    """After a write: sync that company soon, once, even when an agent writes ten things in a row."""
+    fortnox_api.cur().wake.set()
 
 
 writes.after_write = request_sync
 
 
-def background():
-    try:
-        reindex()
-    except Exception as e:
-        log(f"index failed: {e}")
-    while True:
-        if fortnox_api.configured() and fortnox_api.status()["inloggat"]:
-            sync_once()
-        if _wake.wait(SYNC_HOURS * 3600):
-            time.sleep(WRITE_SETTLE)  # let a burst of writes finish first
-        _wake.clear()
+def background(company):
+    """One company's loop, in its own thread: whatever happens to it stays with it."""
+    with fortnox_api.use(company):
+        try:
+            reindex()
+        except Exception as e:
+            log(f"index {company.slug} failed: {e}")
+        while True:
+            try:
+                if fortnox_api.configured() and fortnox_api.status()["inloggat"]:
+                    sync_once(company)
+            except Exception as e:
+                log(f"sync loop {company.slug}: {type(e).__name__}: {e}")
+            if company.wake.wait(SYNC_HOURS * 3600):
+                time.sleep(WRITE_SETTLE)  # let a burst of writes finish first
+            company.wake.clear()
+
+
+def prepare():
+    """Each served company's folder and an index file to read, before anything asks for them."""
+    for company in fortnox_api.SLOTS.values():
+        os.makedirs(company.root, exist_ok=True)
+        if not os.path.exists(company.manifest):
+            open(company.manifest, "a").close()
+
+
+def overview(links=False):
+    """Every company for the operator: signed in or waiting, whose books, how much. No keys and no
+    tokens. links (the answer at /health/<OAUTH_START_TOKEN>, not the log): each company's own
+    sign-in address, the one to send to its administrator."""
+    rows = []
+    for slug, company in sorted(fortnox_api.SLOTS.items()):
+        with fortnox_api.use(company):
+            st = fortnox_api.status()
+        try:
+            with open(company.manifest) as f:
+                docs = sum(1 for l in f if '.pdf"' in l)
+        except OSError:
+            docs = 0
+        rows.append({"company": slug, "signed_in": st["inloggat"], "name": st["bolag"],
+                     "organisation_number": st["organisationsnummer"], "documents": docs,
+                     "last_sync": st["senaste_synk"], "token_refreshed": st["token_fornyad"],
+                     "keys": sorted(n for n, c in KEYS.values() if c == slug),
+                     "sign_in": company.start_path, "folder": company.root})
+        if links and OAUTH_START:
+            rows[-1]["sign_in_link"] = f"{PUBLIC_URL}/oauth/start/{start_code(slug)}/{slug}"
+    return {"companies": rows, "not_served": fortnox_api.dormant()}
 
 
 def banner(title, tagline, rows):
@@ -841,35 +954,43 @@ def main():
     if not os.path.isdir(DATA):
         log(f"{DATA} not found -- is the data folder mounted?")
         sys.exit(1)
-    if not os.path.exists(MANIFEST):
-        open(MANIFEST, "a").close()
+    prepare()
     if OAUTH_START and len(OAUTH_START) < 32:
         log("OAUTH_START_TOKEN shorter than 32 characters: Fortnox sign-in disabled")
         globals()["OAUTH_START"] = ""
     port = int(os.environ.get("PORT", "8000"))
-    st = fortnox_api.status()
-    with open(MANIFEST) as f:
-        docs = sum(1 for l in f if '.pdf"' in l)
+    view = overview()
     if not fortnox_api.configured():
         api = "not configured: set FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET and FORTNOX_REDIRECT_URI"
-    elif st["inloggat"]:
-        api = f"signed in to {st['bolag'] or '?'}, last sync {st['senaste_synk'] or 'not yet'}"
     else:
-        api = "configured, waiting for sign-in" + (" at /oauth/start/<OAUTH_START_TOKEN>" if OAUTH_START else
-                                                   " (OAUTH_START_TOKEN not set: sign-in off)")
-    banner(f"agentmcp-fortnox {SERVER_VERSION}", "One company's Fortnox for agents" +
+        api = f"one integration for every company, redirect {fortnox_api.REDIRECT_URI}" + (
+            "" if OAUTH_START else " (OAUTH_START_TOKEN not set: sign-in off)")
+    companies = []
+    for c in view["companies"]:
+        if c["signed_in"]:
+            state = f"signed in to {c['name'] or '?'} ({c['organisation_number'] or 'no org.nr'}), last sync {c['last_sync'] or 'not yet'}"
+        else:
+            state = f"waiting for sign-in at {c['sign_in']}"
+        companies.append(("company", f"{c['company']}: {state}; {c['documents']} documents; "
+                                     f"key(s) {', '.join(c['keys'])}; {c['folder']}"))
+    if view["not_served"]:
+        companies.append(("unused", f"{', '.join(view['not_served'])}: signed in earlier, no key in MCP_KEYS reaches "
+                                    "it now; nothing reads or syncs it"))
+    n = len(view["companies"])
+    banner(f"agentmcp-fortnox {SERVER_VERSION}",
+           ("One company's Fortnox for agents" if n == 1 else f"Fortnox for agents, {n} companies") +
            (", read-only" if fortnox_api.READ_ONLY else ", read and write"), [
         ("mcp", f"POST :{port}/mcp, {len(TOOLS)} tools"),
         ("public", PUBLIC_URL or "(PUBLIC_URL not set: PDF links are relative)"),
-        ("agents", f"{len(KEYS)} key(s): {', '.join(sorted(KEYS.values()))}"),
+        ("agents", f"{len(KEYS)} key(s), each bound to one company"),
         ("fortnox", api),
         ("account", (fortnox_api.ACCOUNT_TYPE or "the user who signs in") + f", scopes: {fortnox_api.SCOPES}"),
-        ("sync", f"every {SYNC_HOURS:g} h and after writes, from {fortnox_api.SYNC_FROM}"),
-        ("state", f"{fortnox_api.STATE} (tokens, write log)"),
-        ("data", f"{DATA}, {docs} documents indexed"),
+        ("sync", f"every {SYNC_HOURS:g} h and after writes, per company, from {fortnox_api.SYNC_FROM}"),
+        *companies,
         ("python", f"{platform.python_version()}, started {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"),
     ])
-    threading.Thread(target=background, daemon=True).start()
+    for company in fortnox_api.SLOTS.values():
+        threading.Thread(target=background, args=(company,), daemon=True, name=f"sync-{company.slug}").start()
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
