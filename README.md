@@ -41,15 +41,15 @@ Files: an agent with a shell sends a PDF with `curl -H "Authorization: Bearer $K
 
 ## In Fortnox
 
-1. In Fortnox' [Developer Portal](https://www.fortnox.se/developer), create an integration for your own company.
+1. In Fortnox' [Developer Portal](https://www.fortnox.se/developer), create an integration. One is enough, also for several companies. Give it a neutral name: Fortnox shows that name ("*name* får åtkomst till …") to everyone who approves it.
 2. Redirect URI: `https://<your domain>/oauth/callback`, exactly, without a trailing slash.
-3. Scopes: what you want the agents to reach. The service asks for `companyinformation bookkeeping invoice supplierinvoice customer supplier article payment archive connectfile inbox settings` unless you set `FORTNOX_SCOPES`; it must not ask for more than the integration allows.
+3. Scopes: what you want the agents to reach. The service asks for `companyinformation bookkeeping invoice supplierinvoice customer supplier article payment archive connectfile inbox settings` unless you set `FORTNOX_SCOPES`; it must not ask for more than the integration allows, or Fortnox refuses the sign-in before anyone has logged in. Without `payment`, `article` and `inbox`, the tools `registrera_betalning`, articles in `spara_register` and `ladda_upp_fil` to the inbox folders are refused by Fortnox. Adding a scope later means ticking it in the portal, widening `FORTNOX_SCOPES` and a new sign-in for each company.
 4. Tick *allow authorization as service account* (or set `FORTNOX_ACCOUNT_TYPE=` empty to sign in as the person who approves).
 5. Copy the client id and secret into the service's environment.
 
-The company needs the Fortnox modules for what the scopes cover (Bokföring, Kundfaktura, Leverantörsfaktura …) and, as Fortnox prices it, an integration licence.
+The company needs the Fortnox modules for what the scopes cover (Bokföring, Kundfaktura, Leverantörsfaktura …) and, as Fortnox prices it, an integration licence. A Fortnox test company needs no licence, which makes it the place to try the sign-in first.
 
-Once the service runs, a system administrator opens `https://<your domain>/oauth/start/<OAUTH_START_TOKEN>` once and approves. The first sync starts right away. The service stays tied to that company: a sign-in to another company is refused.
+Once the service runs, a system administrator opens `https://<your domain>/oauth/start/<OAUTH_START_TOKEN>` once and approves, in that same browser and within ten minutes. The first sync starts right away. The service stays tied to that company: a sign-in to another company is refused.
 
 ## Several companies
 
@@ -59,10 +59,22 @@ One integration and one redirect URI are enough for any number of companies: For
 MCP_KEYS=peter:<key>:optic,fredrik:<key>:resta,revisorn:<key>:optic
 ```
 
+### How it works
+
+1. **Name the company in a key.** Add `name:key:company` to `MCP_KEYS` and restart (on AgentHotel: redeploy). The company now exists as an empty place: the start log has a row for it, "waiting for sign-in", and its folder is `/data/companies/<company>`.
+2. **Get its sign-in link.** Open `https://<your domain>/health/<OAUTH_START_TOKEN>` and copy that company's `sign_in_link`. It looks like `https://<your domain>/oauth/start/<40 characters>/<company>`.
+3. **The company's administrator approves.** They open the link, log in to Fortnox and pick the company. Fortnox shows what the integration asks for, under the integration's name from the Developer Portal, and they press *Godkänn & aktivera*. Fortnox sends the browser back to `/oauth/callback`, the one redirect URI for every company, and the service answers with a page naming the company and the place it was connected to.
+4. **The first sync runs at once**, seconds for a small company, and then every 6 hours and after each write. The overview shows the company's name, organisation number, documents and last sync.
+5. **The agent uses its key.** `https://<your domain>/mcp` with `Authorization: Bearer <key>` reaches that company and no other. An agent that works for two companies gets two keys and two MCP server entries, one per company.
+
+Try it first with a test company in a place of its own, say `test`, with its own key. Do not sign a test company in to a real company's place to "switch later": a place is tied to the first company that signs in.
+
+### The rules
+
 - `peter` and `revisorn` reach the company `optic`, `fredrik` reaches `resta`. A key reaches one company, always the same one. Nothing an agent sends can change it: the tools, `/upload` and the PDF links all take the company from the key.
 - Each company signs in at its own address. The system administrator of *that* company opens it and approves in the same browser, within ten minutes; if the person has several companies in Fortnox, they pick the right one there. The link to Fortnox that the address leads to cannot be passed on to someone else: an approval from another browser is refused. The page that follows names the company that was connected. The redirect URI registered in Fortnox stays `https://<your domain>/oauth/callback` for all of them.
 - Which address: `https://<your domain>/oauth/start/<OAUTH_START_TOKEN>/<company>` works, e.g. `…/optic`, and is fine when you open it yourself. To *send* one to a company's administrator, take that company's `sign_in_link` from the overview below instead: it has a code of its own in place of the token, and opens that company's sign-in and nothing else. `OAUTH_START_TOKEN` itself opens every company's sign-in and the overview, so with several organisations in one service it stays with you.
-- A company's place stays tied to the Fortnox company that first signed in to it, and one Fortnox company can be in one place only: signing `resta` in to the company that is already `optic` is refused.
+- A company's place stays tied to the Fortnox company that first signed in to it, and one Fortnox company can be in one place only: signing `resta` in to the company that is already `optic` is refused. Companies are told apart by their database number in Fortnox, so two companies with the same organisation number (a company and its test company) are two companies.
 - Each company has its own folder, tokens, synced books and documents, upload store, write log and sync. If one company's sign-in is withdrawn in Fortnox, the others carry on.
 - Only a company that some key in `MCP_KEYS` names can be signed in. Remove the last key of a company and it is no longer served; what it had stays on disk until you delete it, and the start banner lists it as unused.
 - A key without a company part, `name:key`, reaches the *default* company, which is the single-company setup described above (`/oauth/start/<OAUTH_START_TOKEN>` with nothing after it). A deployment from before 2.1.0 is exactly that and needs no change. You can add named companies next to it.
