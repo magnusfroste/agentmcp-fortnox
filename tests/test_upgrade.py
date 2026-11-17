@@ -16,7 +16,7 @@ import pytest
 
 import fake_fortnox
 import index
-from conftest import FAKE, FAKE_URL, KEY, REDIRECT, START, NoRedirect
+from conftest import FAKE, FAKE_URL, KEY, START, NoRedirect, started
 
 OLD_AB = fake_fortnox.Company("Gamla Bolaget AB", "556100-0001", 6001, vouchers=[
     ("2026-02-05", "Gammal hyra", [(5010, 800, 0), (1930, 0, 800)])], invoices=[("2026-02-20", "Gammal Kund AB", 100.0)])
@@ -76,13 +76,13 @@ def tree(data):
 class Service:
     """mcp_server.py as its own process on a data folder, as a deploy runs it."""
 
-    def __init__(self, data, keys):
+    def __init__(self, data, keys, **more):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         self.base, self.data = f"http://127.0.0.1:{port}", data
         env = {**os.environ, "DATA_DIR": str(data), "PORT": str(port), "MCP_KEYS": keys,
-               "FORTNOX_API_BASE": FAKE_URL, "FORTNOX_AUTH_BASE": FAKE_URL, "PYTHONDONTWRITEBYTECODE": "1"}
+               "FORTNOX_API_BASE": FAKE_URL, "FORTNOX_AUTH_BASE": FAKE_URL, "PYTHONDONTWRITEBYTECODE": "1", **more}
         self.out = open(os.path.join(data, "..", f"service-{port}.log"), "w+")
         self.process = subprocess.Popen([sys.executable, "-u", os.path.join(APP, "mcp_server.py")], env=env,
                                         stdout=self.out, stderr=subprocess.STDOUT)
@@ -112,8 +112,9 @@ class Service:
             time.sleep(0.1)
         raise AssertionError(f"waited {seconds} s for {what}:\n{self.log()}")
 
-    def http(self, method, path, body=None, key=KEY):
-        headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
+    def http(self, method, path, body=None, key=KEY, cookie=None):
+        headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {}),
+                   **({"Cookie": cookie} if cookie else {})}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
                                      method=method, headers=headers)
         try:
@@ -179,11 +180,9 @@ def test_a_second_company_is_added_next_to_it(old_folder):
         view = s.overview()
         assert view["default"]["signed_in"] and view["default"]["name"] == "Gamla Bolaget AB"
         assert not view["nytt"]["signed_in"] and view["nytt"]["sign_in"] == "/oauth/start/<OAUTH_START_TOKEN>/nytt"
-        _, headers, _ = s.http("GET", f"/oauth/start/{START}/nytt", key=None)
-        q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(headers["Location"]).query).items()}
-        assert q["redirect_uri"] == REDIRECT
+        q = started(s.http("GET", f"/oauth/start/{START}/nytt", key=None))
         code = FAKE.issue_code(q["code_challenge"], NEW_AB)
-        assert s.http("GET", f"/oauth/callback?code={code}&state={q['state']}", key=None)[0] == 200
+        assert s.http("GET", f"/oauth/callback?code={code}&state={q['state']}", key=None, cookie=q["cookie"])[0] == 200
         s.wait(lambda: s.overview()["nytt"]["documents"] == 1, "the new company's first sync")
         assert s.tool("kalla_status", key=NEW_KEY)["bolag"] == "Nya Bolaget AB"
         assert [v["beskrivning"] for v in s.tool("verifikationer", key=NEW_KEY)["verifikationer"]] == ["Nytt bolag hyra"]
@@ -207,3 +206,25 @@ def test_a_second_company_is_added_next_to_it(old_folder):
         s.wait(lambda: "index default:" in s.log(), "the index at start")
         assert [d["motpart"] for d in s.tool("lista_dokument")["dokument"]] == ["Gammal Kund AB"]
         assert "unused" in s.log() and "nytt" in s.log()
+
+
+def test_a_state_folder_of_ones_own_choosing_holds_only_the_default_companys(tmp_path):
+    """STATE_DIR moves the default company's state, as in 2.0.0, and may well be a plain folder in
+    DATA_DIR that its index walks. A named company's state stays in its own folder, out of that walk."""
+    data = tmp_path / "data"
+    data.mkdir()
+    env = {"STATE_DIR": str(data / "state")}
+    keys = f"hermes:{KEY},ny:{NEW_KEY}:nytt"
+    with Service(str(data), keys, **env) as s:
+        status, _, body = s.http("POST", "/upload?namn=kvitto-nytt.pdf", {"kvitto": "nytt bolag"}, key=NEW_KEY)
+        assert status == 200
+        assert s.http("POST", "/upload?namn=kvitto-eget.pdf", {"kvitto": "eget"})[0] == 200
+    uploads = data / "companies" / "nytt" / ".state" / "uploads"
+    assert [f.name.split("__")[1] for f in uploads.iterdir()] == ["kvitto-nytt.pdf"]
+    assert [f.name.split("__")[1] for f in (data / "state" / "uploads").iterdir()] == ["kvitto-eget.pdf"]
+    assert not (data / "state" / "companies").exists()
+    with Service(str(data), keys, **env) as s:  # the start indexes each company's folder
+        s.wait(lambda: "index default:" in s.log() and "index nytt:" in s.log(), "the index at start")
+        mine = json.dumps(s.tool("exportera_index")["rader"])
+        assert "kvitto-nytt" not in mine and "companies" not in mine
+        assert s.tool("sammanfattning", key=NEW_KEY)["dokument"] == 0

@@ -81,8 +81,9 @@ def load_keys():
         elif len(key) < 32:
             log(f"key for {name!r} ignored: shorter than 32 characters")
         elif key in twice or keys.get(key, (name, company))[1] != company:
-            log(f"key for {name!r} ignored: the same key is bound to two companies; a key reaches exactly one")
-            keys.pop(key, None)
+            first = keys.pop(key, (None, None))[0]
+            log(f"key for {name!r} ignored{f', and for {first!r}' if first else ''}: the same key is bound to "
+                "two companies; a key reaches exactly one")
             twice.add(key)
         else:
             keys[key] = (name, company)
@@ -782,13 +783,20 @@ class Handler(BaseHTTPRequestHandler):
             if not fortnox_api.configured():
                 return self.page(503, "Fortnox är inte konfigurerat",
                                  "FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET och FORTNOX_REDIRECT_URI saknas.")
-            return self.send(302, b"", "text/plain", {"Location": fortnox_api.authorize_url(company)})
+            url, (name, value) = fortnox_api.authorize_url(company)
+            secure = "; Secure" if fortnox_api.REDIRECT_URI.startswith("https://") else ""
+            return self.send(302, b"", "text/plain", {"Location": url, "Set-Cookie": (
+                f"{name}={value}; Max-Age={fortnox_api.PENDING_SECONDS}; Path=/oauth/callback; HttpOnly; "
+                f"SameSite=Lax{secure}")})
         if path == "/oauth/callback":  # the one redirect URI in Fortnox; the signed state says which company
             q = urllib.parse.parse_qs(query)
             if "error" in q:
                 return self.page(400, "Inloggningen avbröts", q.get("error_description", q["error"])[0])
+            state = q.get("state", [""])[0]
+            cookies = dict(c.strip().partition("=")[::2] for c in self.headers.get("Cookie", "").split(";"))
             try:
-                company, name = fortnox_api.finish(q.get("code", [""])[0], q.get("state", [""])[0])
+                company, name = fortnox_api.finish(q.get("code", [""])[0], state,
+                                                   cookies.get(fortnox_api.cookie_for(state)))
             except Exception as e:
                 log(f"oauth callback failed: {e}")
                 return self.page(400, "Inloggningen misslyckades", str(e)[:300])
@@ -912,9 +920,12 @@ def background(company):
 def prepare():
     """Each served company's folder and an index file to read, before anything asks for them."""
     for company in fortnox_api.SLOTS.values():
-        os.makedirs(company.root, exist_ok=True)
-        if not os.path.exists(company.manifest):
-            open(company.manifest, "a").close()
+        try:
+            os.makedirs(company.root, exist_ok=True)
+            if not os.path.exists(company.manifest):
+                open(company.manifest, "a").close()
+        except OSError as e:  # that company answers with an error; the others start
+            log(f"{company.slug}: cannot prepare {company.root}: {e}")
 
 
 def overview(links=False):
@@ -923,8 +934,12 @@ def overview(links=False):
     sign-in address, the one to send to its administrator."""
     rows = []
     for slug, company in sorted(fortnox_api.SLOTS.items()):
-        with fortnox_api.use(company):
-            st = fortnox_api.status()
+        try:
+            with fortnox_api.use(company):
+                st = fortnox_api.status()
+        except Exception as e:  # a damaged state file is that company's trouble, shown as such
+            log(f"{slug}: state cannot be read: {type(e).__name__}: {e}")
+            st = {"inloggat": False, "bolag": None, "organisationsnummer": None, "senaste_synk": None, "token_fornyad": None}
         try:
             with open(company.manifest) as f:
                 docs = sum(1 for l in f if '.pdf"' in l)

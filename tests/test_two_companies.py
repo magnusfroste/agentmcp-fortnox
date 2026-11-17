@@ -8,8 +8,9 @@ import urllib.parse
 
 import fortnox_api
 import mcp_server
+import fake_fortnox
 from conftest import (ALFA, ALFA_AB, ALFA_KEY, BETA, BETA_AB, BETA_KEY, DATA, FAKE, GAMMA, GAMMA_KEY, KEY, MAIN,
-                      OTHER_KEY, REDIRECT, START, http, ok, sign_in, start_sign_in, status_of, tool)
+                      OTHER_KEY, REDIRECT, START, callback, http, ok, sign_in, start_sign_in, started, status_of, tool)
 
 VOUCHER = {"datum": "2026-03-10", "rader": [{"konto": "5010", "debet": 300}, {"konto": "1930", "kredit": 300}]}
 
@@ -127,15 +128,48 @@ def test_a_sign_in_cannot_be_moved_or_replayed(two_more):
     q = start_sign_in("gamma")
     slug, nonce, mac = q["state"].split(".")
     for forged in (f"alfa.{nonce}.{mac}", f"gamma.{nonce}.{'0' * len(mac)}", f"gamma.{nonce}", nonce, ""):
-        code = FAKE.issue_code(q["code_challenge"], ALFA_AB)
-        status, _, body = http("GET", f"/oauth/callback?code={code}&state={urllib.parse.quote(forged)}", key=None)
-        assert status == 400 and "Okänd eller för gammal" in body.decode(), forged
+        status, body = callback(q, ALFA_AB, state=forged)
+        assert status == 400 and "Okänd eller för gammal" in body, forged
     q = start_sign_in("alfa")
-    code = FAKE.issue_code(q["code_challenge"], ALFA_AB)
-    assert http("GET", f"/oauth/callback?code={code}&state={q['state']}", key=None)[0] == 200
-    code = FAKE.issue_code(q["code_challenge"], ALFA_AB)
-    assert http("GET", f"/oauth/callback?code={code}&state={q['state']}", key=None)[0] == 400  # a state works once
+    assert callback(q, ALFA_AB)[0] == 200
+    assert callback(q, ALFA_AB)[0] == 400  # a state works once
     assert not os.path.exists(GAMMA.token)
+
+
+def test_the_approval_must_come_from_the_browser_that_opened_the_address(two_more):
+    """Whoever has the address of an empty place could otherwise send the Fortnox link on to another
+    company's administrator, and get that company's books in their own place."""
+    victim = fake_fortnox.Company("Offer AB", "559900-4444", 5004, vouchers=[
+        ("2026-02-08", "Offrets hyra", [(5010, 1, 0), (1930, 0, 1)])])
+    q = start_sign_in("gamma")           # gamma's holder opens the address and passes the Fortnox link on
+    other = start_sign_in("gamma")       # (and has a cookie of their own, from another start)
+    for cookie in (None, other["cookie"], q["cookie"].split("=")[0] + "=guess"):
+        status, body = callback(q, victim, cookie=cookie)  # the victim approves in their own browser
+        assert status == 400 and "samma webbläsare" in body
+    assert not os.path.exists(GAMMA.token)
+    assert ok("kalla_status", key=GAMMA_KEY)["inloggat"] is False
+    assert not [c for c in victim.calls]  # nothing was fetched from the victim's Fortnox
+    q = start_sign_in("alfa")            # the right browser is not locked out by someone else's attempt
+    assert callback(q, ALFA_AB, cookie=None)[0] == 400
+    assert callback(q, ALFA_AB)[0] == 200
+
+
+def test_a_started_sign_in_runs_out(two_more):
+    q = start_sign_in("gamma")
+    nonce = q["state"].split(".")[1]
+    verifier, created, slug, browser = fortnox_api._pending[nonce]
+    fortnox_api._pending[nonce] = (verifier, created - fortnox_api.PENDING_SECONDS - 1, slug, browser)
+    status, body = callback(q, ALFA_AB)
+    assert status == 400 and "för gammal" in body and nonce not in fortnox_api._pending
+
+
+def test_a_place_cannot_change_company_by_dropping_its_token(two_more):
+    """What the refusal tells the operator to do for a named company: the whole folder, not the token."""
+    status, body = sign_in("beta", ALFA_AB)
+    assert status == 400 and f"ta bort hela mappen {BETA.root}" in body.decode()
+    unknown = fake_fortnox.Company("Okänt AB", "", None)  # Fortnox says nothing to tell it by: not let in
+    status, body = sign_in("beta", unknown)
+    assert status == 400 and "redan kopplad till Beta Gård AB" in body.decode()
 
 
 def test_a_companys_own_sign_in_address_opens_nothing_else(two_more):
@@ -145,11 +179,9 @@ def test_a_companys_own_sign_in_address_opens_nothing_else(two_more):
     assert f"{link.scheme}://{link.netloc}" == "https://fortnox.example.se" and START not in link.path
     code = link.path.split("/")[3]
     assert link.path == f"/oauth/start/{code}/alfa" and len(code) == 40
-    status, headers, _ = http("GET", link.path, key=None)
-    q = urllib.parse.parse_qs(urllib.parse.urlparse(headers["Location"]).query)
-    assert status == 302 and q["state"][0].split(".")[0] == "alfa" and q["redirect_uri"] == [REDIRECT]
-    answer = FAKE.issue_code(q["code_challenge"][0], ALFA_AB)
-    assert http("GET", f"/oauth/callback?code={answer}&state={q['state'][0]}", key=None)[0] == 200
+    q = started(http("GET", link.path, key=None))
+    assert q["state"].split(".")[0] == "alfa" and q["redirect_uri"] == REDIRECT
+    assert callback(q, ALFA_AB)[0] == 200
     for path in (f"/oauth/start/{code}/beta", f"/oauth/start/{code}/gamma", f"/oauth/start/{code}",
                  f"/oauth/start/{code}/default", f"/oauth/start/{code}/nosuch", f"/health/{code}"):
         assert http("GET", path, key=None)[0] == 404, path
@@ -255,4 +287,5 @@ def test_a_key_entry_is_bound_as_written_or_not_at_all(monkeypatch, capsys):
     out = capsys.readouterr().out
     for name in ("bad-company", "too-many", "short", "empty-company", "twice-again"):
         assert f"key for {name!r} ignored" in out
+    assert "and for 'twice'" in out
     assert not [x for x in k if x in out] and "not a slug" not in out  # nothing of an entry's value is logged

@@ -29,8 +29,9 @@ Environment:
 
 Folders. The default company (keys without a company part) is a single-company deployment as it
 always was: <root> = DATA_DIR, state in STATE_DIR. A named company has the same layout one level
-down: <root> = DATA_DIR/companies/<slug>, state in <root>/.state (STATE_DIR/companies/<slug> when
-STATE_DIR is set). The default company's index never walks DATA_DIR/companies.
+down: <root> = DATA_DIR/companies/<slug>, state in <root>/.state whatever STATE_DIR says, so that
+a company is one folder and its state is never somewhere another company's index walks. The
+default company's index never walks DATA_DIR/companies.
 
 Layout written: <root>/fortnox-api/<year>/<month>/<Leverantörsfakturor|Kundfakturor|Verifikationer>/
 <nr>_<fileid>_<name>.pdf, each with <file>.json holding date, counterpart, amount, currency and the
@@ -77,7 +78,8 @@ DEFAULT = "default"     # the company of a key without a company part: the singl
 COMPANIES = index.COMPANIES  # DATA_DIR/companies/<slug>: the named companies; the index skips it
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _signin_lock = threading.Lock()
-_pending = {}           # nonce -> (code_verifier, created, slug)
+_pending = {}           # nonce -> (code_verifier, created, slug, browser)
+PENDING_SECONDS = 600
 _state_key = secrets.token_bytes(32)  # signs the OAuth state; pending sign-ins die with the process anyway
 
 
@@ -98,8 +100,7 @@ class Slot:
             self.root, self.state = DATA, STATE
         else:
             self.root = os.path.join(DATA, COMPANIES, slug)
-            self.state = (os.path.join(os.environ["STATE_DIR"], COMPANIES, slug) if os.environ.get("STATE_DIR")
-                          else os.path.join(self.root, ".state"))
+            self.state = os.path.join(self.root, ".state")
         self.token = os.path.join(self.state, "token.json")
         self.synced = os.path.join(self.state, "sync.json")
         self.writes = os.path.join(self.state, "writes.jsonl")
@@ -176,24 +177,44 @@ def _state_mac(slug, nonce):
     return hmac.new(_state_key, f"{slug}.{nonce}".encode(), hashlib.sha256).hexdigest()[:24]
 
 
+class WrongBrowser(ValueError):
+    """The callback came from another browser than the one that opened the start address."""
+
+
 def authorize_url(s):
-    """Where to send the person who signs in for company s. The redirect URI is the one registered
-    in Fortnox for every company; which company comes back is in the signed state. PKCE verifier
-    and state are kept in memory for 10 minutes."""
+    """Where to send the person who signs in for company s, and the cookie (name, value) their
+    browser must bring back to the callback. The redirect URI is the one registered in Fortnox for
+    every company; which company comes back is in the signed state. PKCE verifier and state are
+    kept in memory for 10 minutes.
+
+    The cookie ties the approval to the browser that opened the start address. Without it, someone
+    with the address of an empty place could pass the Fortnox link on to another company's
+    administrator, whose approval would then put that company's books in the first one's place."""
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     nonce = secrets.token_urlsafe(16).replace(".", "-")
     state = f"{s.slug}.{nonce}.{_state_mac(s.slug, nonce)}"
     now = time.time()
-    for k in [k for k, (_, t, _) in list(_pending.items()) if now - t > 600]:
+    for k in [k for k, p in list(_pending.items()) if now - p[1] > PENDING_SECONDS]:
         _pending.pop(k, None)
-    _pending[nonce] = (verifier, now, s.slug)
+    browser = secrets.token_urlsafe(24)
+    _pending[nonce] = (verifier, now, s.slug, browser)
     q = {"client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "scope": SCOPES, "state": state,
          "access_type": "offline", "response_type": "code",
          "code_challenge": challenge, "code_challenge_method": "S256"}
     if ACCOUNT_TYPE:
         q["account_type"] = ACCOUNT_TYPE
-    return f"{AUTH}/oauth-v1/auth?{urllib.parse.urlencode(q, quote_via=urllib.parse.quote)}"
+    return (f"{AUTH}/oauth-v1/auth?{urllib.parse.urlencode(q, quote_via=urllib.parse.quote)}",
+            (COOKIE + nonce, browser))
+
+
+COOKIE = "fortnox_signin_"
+
+
+def cookie_for(state):
+    """The name of the cookie the callback must carry for this state."""
+    parts = (state or "").split(".")
+    return COOKIE + parts[1] if len(parts) == 3 else None
 
 
 def _token_request(form):
@@ -222,9 +243,9 @@ def _same_company(a, b):
 def _slugs_on_disk():
     """Every company with a folder here, served now or left from an earlier configuration."""
     found = {DEFAULT, *SLOTS}
-    for base in {os.path.join(DATA, COMPANIES), os.path.join(os.environ.get("STATE_DIR") or DATA, COMPANIES)}:
-        if os.path.isdir(base):
-            found.update(d for d in os.listdir(base) if SLUG.fullmatch(d))
+    base = os.path.join(DATA, COMPANIES)
+    if os.path.isdir(base):
+        found.update(d for d in os.listdir(base) if SLUG.fullmatch(d))
     return sorted(found)
 
 
@@ -233,16 +254,22 @@ def dormant():
     return [slug for slug in _slugs_on_disk() if slug not in SLOTS and os.path.exists(Slot(slug).token)]
 
 
-def finish(code, state):
+def finish(code, state, browser):
     """Exchange the code from the callback and keep the tokens in the company the state names.
-    Returns (slot, company name) for the page."""
+    browser: the value of the cookie cookie_for(state) the request carried. Returns (slot, company
+    name) for the page."""
     parts = (state or "").split(".")
     slug, nonce, mac = parts if len(parts) == 3 else ("", "", "")
     signed = hmac.compare_digest(mac.encode(), _state_mac(slug, nonce).encode())
-    verifier, _, started_for = _pending.pop(nonce, (None, None, None)) if signed else (None, None, None)
+    verifier, created, started_for, expected = _pending.get(nonce, (None, 0, None, "")) if signed else (None, 0, None, "")
     s = SLOTS.get(slug)
-    if not (verifier and s and started_for == slug):
-        raise ValueError("Okänd eller för gammal inloggning. Börja om från /oauth/start.")
+    if not (verifier and s and started_for == slug and time.time() - created <= PENDING_SECONDS):
+        _pending.pop(nonce, None) if signed else None
+        raise ValueError("Okänd eller för gammal inloggning. Börja om från inloggningsadressen.")
+    if not hmac.compare_digest((browser or "").encode(), expected.encode()):  # kept: the right browser may still come
+        raise WrongBrowser("Inloggningen måste godkännas i samma webbläsare som öppnade inloggningsadressen. "
+                           "Öppna adressen igen och godkänn där; skicka inte Fortnox-länken vidare.")
+    _pending.pop(nonce, None)
     t = _token_request({"grant_type": "authorization_code", "code": code,
                         "redirect_uri": REDIRECT_URI, "code_verifier": verifier})
     if not t.get("refresh_token"):
@@ -256,10 +283,13 @@ def finish(code, state):
         old = _load(s.token, None)
         # The start link is a secret, but whoever holds it must not be able to swap in another company:
         # its books would land in this company's data next to the real one's.
-        if old and _same_company(old, t) is False:
+        same = _same_company(old, t) if old else True
+        if same is False or (same is None and (old.get("database_number") or old.get("organisation_number"))):
+            # Only the token gone would leave the old company's books and write log under the new one's name.
+            how = (f"ta bort token.json i {s.state} först" if s.slug == DEFAULT else
+                   f"ta bort hela mappen {s.root} och starta om tjänsten")
             raise ValueError(f"{_place(s)} är redan kopplad till {old.get('company')}. En inloggning mot "
-                             f"{t['company'] or 'ett annat företag'} sparas inte. Byte av företag görs genom att "
-                             f"ta bort token.json i {s.state} först.")
+                             f"{t['company'] or 'ett annat företag'} sparas inte. Byte av företag görs genom att {how}.")
         # And one Fortnox company lives in one place: two copies of the same books, each with its own
         # refresh token and write log, would drift apart.
         for other in _slugs_on_disk():

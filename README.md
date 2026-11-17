@@ -60,7 +60,7 @@ MCP_KEYS=peter:<key>:optic,fredrik:<key>:resta,revisorn:<key>:optic
 ```
 
 - `peter` and `revisorn` reach the company `optic`, `fredrik` reaches `resta`. A key reaches one company, always the same one. Nothing an agent sends can change it: the tools, `/upload` and the PDF links all take the company from the key.
-- Each company signs in at its own address. The system administrator of *that* company opens it and approves; if the person has several companies in Fortnox, they pick the right one there. The page that follows names the company that was connected. The redirect URI registered in Fortnox stays `https://<your domain>/oauth/callback` for all of them.
+- Each company signs in at its own address. The system administrator of *that* company opens it and approves in the same browser, within ten minutes; if the person has several companies in Fortnox, they pick the right one there. The link to Fortnox that the address leads to cannot be passed on to someone else: an approval from another browser is refused. The page that follows names the company that was connected. The redirect URI registered in Fortnox stays `https://<your domain>/oauth/callback` for all of them.
 - Which address: `https://<your domain>/oauth/start/<OAUTH_START_TOKEN>/<company>` works, e.g. `…/optic`, and is fine when you open it yourself. To *send* one to a company's administrator, take that company's `sign_in_link` from the overview below instead: it has a code of its own in place of the token, and opens that company's sign-in and nothing else. `OAUTH_START_TOKEN` itself opens every company's sign-in and the overview, so with several organisations in one service it stays with you.
 - A company's place stays tied to the Fortnox company that first signed in to it, and one Fortnox company can be in one place only: signing `resta` in to the company that is already `optic` is refused.
 - Each company has its own folder, tokens, synced books and documents, upload store, write log and sync. If one company's sign-in is withdrawn in Fortnox, the others carry on.
@@ -109,7 +109,7 @@ Create an **App** service with source GitHub `magnusfroste/agentmcp-fortnox`, br
 
 | Variable | |
 |---|---|
-| `MCP_KEYS` | `name:key` or `name:key:company`, comma separated, keys 32+ characters. One per agent: the name is in the log and on every write, the company (`a-z`, `0-9`, `-`, at most 32 characters) is the one that key reaches. Without a company: the default company. An entry that cannot be read is left out and named in the log, never bound elsewhere |
+| `MCP_KEYS` | `name:key` or `name:key:company`, comma separated, keys 32+ characters without `:`. One per agent: the name is in the log and on every write, the company (`a-z`, `0-9`, `-`, at most 32 characters) is the one that key reaches. Without a company: the default company. An entry that cannot be read is left out and named in the log, never bound elsewhere |
 | `OAUTH_START_TOKEN` | 32+ characters; the secret part of the sign-in addresses and of `/health/<token>`. Without it both are off |
 | `LINK_SECRET` | Signs the PDF links |
 | `PUBLIC_URL` | `https://<your domain>` |
@@ -122,8 +122,8 @@ Create an **App** service with source GitHub `magnusfroste/agentmcp-fortnox`, br
 | `SYNC_HOURS` | Hours between syncs (6). A write also starts one |
 | `INDEX_REFERENCES` | Optional order-number prefixes to pick out of documents, e.g. `SO,PO,WO` |
 | `INDEX_WORDS` | Optional words to note in documents, e.g. `hyra,frakt` |
-| `REPORT_LINK_BASE` | Optional: where a report site serves the data folder, for links in published reports |
-| `STATE_DIR` | Optional: where the default company's tokens and write log go instead of `/data/.state`; named companies then use `STATE_DIR/companies/<company>` |
+| `REPORT_LINK_BASE` | Optional: where a report site serves the data folder, for links in published reports. That site serves every company's folder: use it only when all of them are yours to show to the same readers |
+| `STATE_DIR` | Optional: where the default company's tokens and write log go instead of `/data/.state`. A named company's are always in its own folder, `/data/companies/<company>/.state` |
 
 ## Security
 

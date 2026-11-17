@@ -93,23 +93,37 @@ def ok(name, key=KEY, **args):
 
 def start_sign_in(company=None):
     """Open the start link (for a named company: /oauth/start/<token>/<company>); returns what the
-    service sends the browser to Fortnox with."""
-    status, headers, _ = http("GET", f"/oauth/start/{START}" + (f"/{company}" if company else ""), key=None)
+    service sends the browser to Fortnox with, and under "cookie" what it gave the browser to keep."""
+    return started(http("GET", f"/oauth/start/{START}" + (f"/{company}" if company else ""), key=None))
+
+
+def started(answer):
+    status, headers, _ = answer
     assert status == 302
     loc = urllib.parse.urlparse(headers["Location"])
     q = {k: v[0] for k, v in urllib.parse.parse_qs(loc.query).items()}
     assert loc.path == "/oauth-v1/auth" and q["code_challenge_method"] == "S256" and q["account_type"] == "service"
     assert q["redirect_uri"] == REDIRECT  # the one registered redirect, whichever company
-    return q
+    cookie, *flags = [x.strip() for x in headers["Set-Cookie"].split(";")]
+    assert {"HttpOnly", "SameSite=Lax", "Secure", "Path=/oauth/callback", "Max-Age=600"} <= set(flags)
+    return {**q, "cookie": cookie}
+
+
+def callback(q, approved_by=None, cookie=True, state=None):
+    """Fortnox sends the browser back after approved_by's administrator approved. cookie: True for
+    the browser that opened the start link, None for another browser, or a cookie of one's own."""
+    code = FAKE.issue_code(q["code_challenge"], approved_by)
+    cookie = q["cookie"] if cookie is True else cookie
+    status, _, body = http("GET", f"/oauth/callback?code={code}&state={urllib.parse.quote(q['state'] if state is None else state)}",
+                           key=None, headers={"Cookie": cookie} if cookie else None)
+    return status, body.decode()
 
 
 def sign_in(company=None, approved_by=None):
     """A sign-in from start link to callback. approved_by: the company in Fortnox whose system
     administrator approves (the fake's main company when not given)."""
-    q = start_sign_in(company)
-    code = FAKE.issue_code(q["code_challenge"], approved_by)
-    status, _, body = http("GET", f"/oauth/callback?code={code}&state={q['state']}", key=None)
-    return status, body
+    status, body = callback(start_sign_in(company), approved_by)
+    return status, body.encode()
 
 
 def status_of(company):
