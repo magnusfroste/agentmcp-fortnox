@@ -1,0 +1,21 @@
+# agentmcp-fortnox with plain Docker: docker compose up -d --build
+# Put your HTTPS proxy in front, on the domain registered in Fortnox, to port 8000.
+services:
+  fortnox:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - fortnox-data:/data
+    # The service runs as the user "fortnox"; the entrypoint needs these three only to hand /data
+    # to it and drop root. Nothing else of root's is kept.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: [/tmp]
+
+volumes:
+  fortnox-data:
